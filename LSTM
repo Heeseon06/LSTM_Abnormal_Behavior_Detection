@@ -1,0 +1,277 @@
+import os
+import shutil
+import cv2
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model, load_model
+from tensorflow.keras.layers import ConvLSTM2D, Conv2D, MaxPooling2D, Flatten, Dense, Dropout, Input, LSTM, GlobalAveragePooling2D, TimeDistributed
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint
+from sklearn.utils.class_weight import compute_class_weight
+import xml.etree.ElementTree as ET
+from tqdm import tqdm
+from collections import deque
+
+# 경로 설정
+base_dir = '/content/drive/MyDrive/LSTM_Detection'
+data_root = f'{base_dir}/data/Anomaly_Detection'
+
+# 디렉토리 설정
+training_label_dir = '/content/drive/MyDrive/LSTM_Detecion/data/Anomaly_Detection/training_sample/라벨링데이터'
+training_source_dir = '/content/drive/MyDrive/LSTM_Detecion/data/Anomaly_Detection/training_sample/원천데이터'
+val_label_dir = '/content/drive/MyDrive/LSTM_Detecion/data/Anomaly_Detection/val_sample/라벨링데이터'
+val_source_dir = '/content/drive/MyDrive/LSTM_Detecion/data/Anomaly_Detection/val_sample/원천데이터'
+
+output_frame_dir = '/content/drive/MyDrive/LSTM_Detecion/extracted_frames'
+output_csv_dir = '/content/drive/MyDrive/LSTM_Detecion/csv_results'
+
+# 1. 프레임 추출 함수 (3개씩 묶어 .npy로 저장)
+def extract_frames(video_path, output_dir):
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    count = 0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.resize(frame, (224, 224))
+        frames.append(frame)
+        if len(frames) == 3:  # 3개씩 묶기
+            output_path = os.path.join(output_dir, f"seq_{count:06d}.npy")
+            np.save(output_path, np.array(frames))
+            frames = []
+            count += 1
+    cap.release()
+
+# 2. XML 파일에서 라벨 읽기 함수
+def read_xml_labels(xml_path):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    labels = []
+    for track in root.iter('track'):
+        if track.attrib['label'] in ['theft_start', 'theft_end']:
+            for box in track.iter('box'):
+                frame_num = int(box.attrib['frame'])
+                labels.append((track.attrib['label'], frame_num))
+    return labels
+
+# 3. 프레임 라벨링 및 CSV 파일로 저장
+def label_frames_and_save_to_csv(labels, num_frames, csv_file_path, output_dir_for_frames):
+    labeled_frames = []
+    theft_started = False
+
+    # 프레임 번호에 따라 라벨을 결정
+    for i in range(1, num_frames + 1):
+        # 'theft_start' 라벨이 있는 프레임이면 절도 시작으로 간주
+        if any(label == 'theft_start' and frame_num == i for label, frame_num in labels):
+            theft_started = True
+
+        # 'theft_end' 라벨이 있는 프레임이면 절도 종료로 간주
+        if any(label == 'theft_end' and frame_num == i for label, frame_num in labels):
+            theft_started = False
+
+        # 현재 절도 상태에 따라 라벨 설정
+        label = 1 if theft_started else 0
+
+        # 해당 프레임의 npy 파일명 생성
+        npy_file = os.path.join(output_dir_for_frames, f"seq_{(i-1)//3:06d}.npy")
+        labeled_frames.append([npy_file, label])
+
+    df = pd.DataFrame(labeled_frames, columns=['sequence', 'label'])
+    df.to_csv(csv_file_path, index=False)
+    print(f"CSV file saved to {csv_file_path}")
+
+# MP4 파일에서 프레임 추출 및 라벨링, CSV 저장
+source_dir = training_source_dir
+label_dir = training_label_dir
+
+file_list = [f for f in os.listdir(source_dir) if f.endswith('.mp4')]
+
+for file in tqdm(file_list):
+    name = file.split('.')[0]
+    video_path = os.path.join(source_dir, file)
+    xml_path = os.path.join(label_dir, f'{name}.xml')
+    output_dir_for_frames = os.path.join(output_frame_dir, f'{name}_frames')
+
+    # 이미지 추출
+    if not os.path.exists(output_dir_for_frames):
+        os.makedirs(output_dir_for_frames)
+    extract_frames(video_path, output_dir_for_frames)
+
+    # XML 파일에서 라벨링 정보 읽기
+    labels = read_xml_labels(xml_path)
+
+    # 프레임 수 계산 (이미지 수로 판단)
+    num_frames = len([f for f in os.listdir(output_dir_for_frames) if f.endswith('.npy')]) * 3
+
+    # 프레임 라벨링 및 CSV 파일로 저장
+    csv_file_path = os.path.join(output_csv_dir, f'{name}_labels.csv')
+    label_frames_and_save_to_csv(labels, num_frames, csv_file_path, output_dir_for_frames)
+
+# 데이터 증강 및 생성
+def load_npy_sequence(sequence_file):
+    return np.load(sequence_file)
+
+def data_generator(csv_file, batch_size, class_weights):
+    df = pd.read_csv(csv_file)
+    datagen = ImageDataGenerator(
+        rotation_range=20,
+        width_shift_range=0.2,
+        height_shift_range=0.2,
+        brightness_range=[0.8, 1.2],
+        horizontal_flip=True,
+        zoom_range=0.2
+    )
+    while True:
+        for start in range(0, len(df), batch_size):
+            end = min(start + batch_size, len(df))
+            batch_sequences = []
+            batch_labels = []
+            for idx in range(start, end):
+                sequence = load_npy_sequence(df.iloc[idx]['sequence'])
+                label = df.iloc[idx]['label']
+
+                # 데이터 증강 적용
+                augmented_sequence = [datagen.random_transform(frame) for frame in sequence]
+
+                batch_sequences.append(augmented_sequence)
+                batch_labels.append(label)
+
+            batch_sequences = np.array(batch_sequences)
+            batch_labels = np.array(batch_labels)
+
+            # 클래스 가중치를 배치에 적용
+            batch_weights = np.array([class_weights[label] for label in batch_labels])
+
+            yield batch_sequences, batch_labels, batch_weights
+
+# 클래스 가중치 계산 함수
+def calculate_class_weights(csv_files, output_csv_dir):
+    all_labels = []
+    for file in csv_files:
+        file_path = os.path.join(output_csv_dir, file)
+        df = pd.read_csv(file_path)
+        all_labels.extend(df['label'].tolist())
+    if not all_labels:
+        return {0: 1.0, 1.0: 1.0}
+    class_weights = compute_class_weight('balanced', classes=np.unique(all_labels), y=all_labels)
+    return dict(enumerate(class_weights))
+
+# 클래스 가중치 계산
+csv_files = [f for f in os.listdir(output_csv_dir) if f.endswith('.csv')]
+class_weights = calculate_class_weights(csv_files, output_csv_dir)
+
+# 모델 정의
+def create_model(input_shape):
+    input_tensor = Input(shape=input_shape)
+    x = ConvLSTM2D(filters=32, kernel_size=(3, 3), padding='same', return_sequences=False)(input_tensor)
+    x = Dropout(0.5)(x)
+    x = Flatten()(x)
+    x = Dense(64, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    output = Dense(1, activation='sigmoid')(x)
+
+    model = Model(inputs=input_tensor, outputs=output)
+    model.compile(optimizer='adam',  # Adam 옵티마이저 사용
+                  loss='binary_crossentropy',
+                  metrics=['accuracy', tf.keras.metrics.AUC()])
+    return model
+
+input_shape = (3, 224, 224, 3)
+model = create_model(input_shape)
+
+batch_size = 8
+train_generator = data_generator(os.path.join(output_csv_dir, csv_files[0]), batch_size, class_weights)
+
+# 데이터셋 크기 계산
+steps_per_epoch = len(csv_files) * (len(pd.read_csv(os.path.join(output_csv_dir, csv_files[0]))) // batch_size)
+
+# 모델 훈련
+checkpoint = ModelCheckpoint('/content/drive/MyDrive/LSTM_Detection/model_checkpoint.keras',
+                             monitor='val_loss', verbose=1, save_best_only=True, mode='min')
+reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001, verbose=1)
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1)
+
+# 첫 번째 세션에서 10 에포크 학습
+model.fit(
+    train_generator,
+    epochs=10,
+    steps_per_epoch=steps_per_epoch,
+    callbacks=[checkpoint, reduce_lr, early_stopping],
+    verbose=1
+)
+# 모델 저장
+model.save('/content/drive/MyDrive/LSTM_Detection/anomaly_detection_model.keras')
+
+
+import cv2
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+# 테스트 비디오에 대해 추론 수행
+model = load_model('/content/drive/MyDrive/LSTM_Detection/anomaly_detection_model.keras')
+video_path = '/content/drive/MyDrive/LSTM_Detecion/data/Anomaly_Detection/test_videos/C_3_12_1_BU_DYA_07-31_16-15-04_CB_RGB_DF2_M1.mp4'
+
+cap = cv2.VideoCapture(video_path)
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = int(cap.get(cv2.CAP_PROP_FPS))
+
+out = cv2.VideoWriter('output_video1.mp4', cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width, frame_height))
+
+frame_buffer = deque(maxlen=3)
+prediction_buffer = deque(maxlen=30)  # 1초(30프레임) 동안의 예측 저장
+threshold = 0.5
+theft_ongoing = False
+frame_count = 0
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    resized_frame = cv2.resize(frame, (224, 224))
+    normalized_frame = resized_frame / 255.0
+    frame_buffer.append(normalized_frame)
+
+    if len(frame_buffer) == 3:
+        input_sequence = np.array([list(frame_buffer)])
+        prediction = model.predict(input_sequence)[0][0]
+        prediction_buffer.append(prediction)
+
+        avg_prediction = np.mean(prediction_buffer)
+
+        if avg_prediction > threshold and not theft_ongoing:
+            theft_ongoing = True
+            cv2.putText(frame, "THEFT STARTED", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        elif avg_prediction <= threshold and theft_ongoing:
+            theft_ongoing = False
+            cv2.putText(frame, "THEFT ENDED", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        text = f"Theft Probability: {avg_prediction:.2f}"
+        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        if theft_ongoing:
+            cv2.rectangle(frame, (0, 0), (frame_width, frame_height), (0, 0, 255), 3)
+        else:
+            cv2.putText(frame, "NO THEFT DETECTED", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+    out.write(frame)
+    frame_count += 1
+
+    if frame_count % 30 == 0:
+        print(f"Processed {frame_count} frames")
+
+cap.release()
+out.release()
+
+print("Video processing completed. Output saved as 'output_video1.mp4'")
+
+# 결과 비디오의 첫 프레임 표시
+cap = cv2.VideoCapture('output_video1.mp4')
+ret, frame = cap.read()
+if ret:
+    from google.colab.patches import cv2_imshow
+    cv2_imshow(frame)
+cap.release()
